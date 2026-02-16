@@ -1,0 +1,79 @@
+--- state.go	2026-02-16 13:06:50.618889222 +0100
++++ state.go	2026-02-16 13:07:37.221637914 +0100
+@@ -7,6 +7,7 @@
+ 	"math/rand"
+ 	"time"
+ 
++	"github.com/google/uuid"
+ 	"github.com/redis/go-redis/v9"
+ )
+ 
+@@ -16,6 +17,13 @@
+ 	StatusShipping:       {StatusDelivered: true, StatusShipFailed: true},
+ }
+ 
++const releaseLockScript = `
++if redis.call("GET", KEYS[1]) == ARGV[1] then
++    return redis.call("DEL", KEYS[1])
++end
++return 0
++`
++
+ type StateMachine struct {
+ 	store              *OrderStore
+ 	rdb                *redis.Client
+@@ -34,11 +42,12 @@
+ 
+ func (sm *StateMachine) Transition(ctx context.Context, orderID, targetState, reason string) error {
+ 	lockKey := fmt.Sprintf("order_lock:%s", orderID)
++	lockVal := uuid.New().String()
+ 
+ 	var acquired bool
+ 	for retries := 0; retries < 50; retries++ {
+ 		var err error
+-		acquired, err = sm.rdb.SetNX(ctx, lockKey, "1", sm.lockTTL).Result()
++		acquired, err = sm.rdb.SetNX(ctx, lockKey, lockVal, sm.lockTTL).Result()
+ 		if err != nil {
+ 			return fmt.Errorf("redis lock error: %w", err)
+ 		}
+@@ -51,11 +60,17 @@
+ 		return ErrLockNotAcquired
+ 	}
+ 
+-	log.Printf("[state] Order %s: lock acquired (value=\"1\", TTL=%v)", orderID, sm.lockTTL)
++	log.Printf("[state] Order %s: lock acquired (owner=%s, TTL=%v)", orderID, lockVal[:8], sm.lockTTL)
+ 
+ 	defer func() {
+-		sm.rdb.Del(ctx, lockKey)
+-		log.Printf("[state] Order %s: lock released (DEL)", orderID)
++		result, err := sm.rdb.Eval(ctx, releaseLockScript, []string{lockKey}, lockVal).Int64()
++		if err != nil && err != redis.Nil {
++			log.Printf("[state] Order %s: lock release error: %v", orderID, err)
++		} else if result == 1 {
++			log.Printf("[state] Order %s: lock released (owner verified)", orderID)
++		} else {
++			log.Printf("[state] Order %s: lock NOT released (ownership lost)", orderID)
++		}
+ 	}()
+ 
+ 	order, err := sm.store.GetOrder(ctx, orderID)
+@@ -74,6 +89,19 @@
+ 		time.Sleep(delay)
+ 	}
+ 
++	currentLockVal, err := sm.rdb.Get(ctx, lockKey).Result()
++	if err == redis.Nil {
++		log.Printf("[state] Order %s: lock expired during processing, aborting", orderID)
++		return ErrLockExpired
++	}
++	if err != nil {
++		return fmt.Errorf("redis ownership check error: %w", err)
++	}
++	if currentLockVal != lockVal {
++		log.Printf("[state] Order %s: lock stolen (expected=%s, found=%s), aborting", orderID, lockVal[:8], currentLockVal[:8])
++		return ErrLockExpired
++	}
++
+ 	err = sm.store.UpdateOrderStatus(ctx, orderID, targetState, reason)
+ 	if err != nil {
+ 		return err
