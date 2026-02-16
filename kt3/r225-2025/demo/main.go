@@ -15,11 +15,12 @@ import (
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-	log.Println("=== Ordering Service (Race Condition Demo) ===")
+	log.Println("=== Ordering Service (Race Condition + Webhook Canonicalization Demo) ===")
 
 	cassandraHost := envOrDefault("CASSANDRA_HOST", "localhost")
 	cassandraTimeout := 120 * time.Second
 	redisAddr := envOrDefault("REDIS_ADDR", "localhost:6379")
+	webhookSecret := envOrDefault("WEBHOOK_SECRET", "default-webhook-secret-change-me")
 
 	maxDelayMs, _ := strconv.Atoi(envOrDefault("MAX_PROCESSING_DELAY_MS", "2000"))
 	maxProcessingDelay := time.Duration(maxDelayMs) * time.Millisecond
@@ -54,7 +55,9 @@ func main() {
 
 	log.Printf("[main] lockTTL=%v, maxProcessingDelay=%v", lockTTL, maxProcessingDelay)
 
-	h := NewHandlers(store, sm)
+	log.Printf("[main] webhookSecret configured (%d chars)", len(webhookSecret))
+
+	h := NewHandlers(store, sm, webhookSecret)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -67,7 +70,11 @@ func main() {
 	r.Get("/orders/{orderID}", h.GetOrder)
 	r.Post("/orders/{orderID}/pay", h.PayOrder)
 	r.Post("/orders/{orderID}/cancel", h.CancelOrder)
+	r.Post("/orders/{orderID}/ship", h.ShipOrder)
 	r.Get("/orders/{orderID}/history", h.GetOrderHistory)
+
+	// Shipping webhook endpoint (receives status updates from logistics provider)
+	r.Post("/webhooks/shipping", h.ShippingWebhook)
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

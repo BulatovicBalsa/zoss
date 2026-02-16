@@ -1,0 +1,63 @@
+@startuml
+title Race Condition napad na Ordering State Machine
+
+skinparam backgroundColor #FEFEFE
+skinparam sequenceMessageAlign center
+
+actor "Napadač" as A
+participant "Ordering servis\n(Goroutine A)" as GA
+participant "Ordering servis\n(Goroutine B)" as GB
+database "Redis" as R
+database "Cassandra" as C
+
+== 1. Kreiranje porudžbine ==
+
+A -> GA: POST /orders
+GA -> C: INSERT status=PENDING_PAYMENT
+GA --> A: 201 Created (order_id)
+
+== 2. Simultani zahtjevi ==
+
+A ->> GA: POST /orders/{id}/pay
+A ->> GB: POST /orders/{id}/cancel
+
+GA -> R: SETNX order_lock:{id} "1" TTL=1s
+R --> GA: OK (lock acquired)
+
+GA -> C: SELECT status
+C --> GA: PENDING_PAYMENT
+
+note over GA: delay = rand(0, 2000ms)\nnpr. 1500ms > TTL
+
+GB -> R: SETNX order_lock:{id} "1" TTL=1s
+R --> GB: FAIL (lock exists)
+
+note over GB: retry...
+
+note over R: TTL ističe na t=1s\nlock automatski obrisan
+
+GB -> R: SETNX order_lock:{id} "1" TTL=1s
+R --> GB: OK (lock re-acquired)
+
+GB -> C: SELECT status
+C --> GB: PENDING_PAYMENT (isto!)
+
+== 3. Oba upisa prolaze ==
+
+GA -> C: UPDATE status=PAID
+GA -> R: DEL order_lock:{id}
+note over R #ffcccc: Briše B-ov lock!\n(DEL ne provjerava vlasništvo)
+GA --> A: 200 OK (PAID)
+
+GB -> C: UPDATE status=CANCELLED
+GB --> A: 200 OK (CANCELLED)
+
+== Rezultat ==
+
+note over C #ffcccc
+  Baza: status=CANCELLED (last-write-wins)
+  Historija: PENDING_PAYMENT→PAID i PENDING_PAYMENT→CANCELLED
+  Oba zahtjeva vratila HTTP 200 — state machine prekršen
+end note
+
+@enduml

@@ -49,6 +49,7 @@ services:
       - MAX_PROCESSING_DELAY_MS=2000
       - LOCK_TTL_MS=1000
       - LISTEN_ADDR=:8080
+      - WEBHOOK_SECRET=super-secret-webhook-key-2024
     depends_on:
       cassandra:
         condition: service_healthy

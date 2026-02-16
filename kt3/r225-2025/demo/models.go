@@ -5,8 +5,6 @@ import (
 	"time"
 )
 
-// --- Order statuses ---
-
 const (
 	StatusPendingPayment = "PENDING_PAYMENT"
 	StatusPaid           = "PAID"
@@ -16,8 +14,6 @@ const (
 	StatusShipFailed     = "SHIP_FAILED"
 )
 
-// --- Error types ---
-
 var (
 	ErrOrderNotFound        = errors.New("order not found")
 	ErrTransitionNotAllowed = errors.New("state transition not allowed")
@@ -25,8 +21,6 @@ var (
 	ErrLockExpired          = errors.New("lock expired or stolen during processing (ownership lost)")
 	ErrTransitionConflict   = errors.New("state changed by another process")
 )
-
-// --- Data models ---
 
 type OrderItem struct {
 	ProductID string  `json:"product_id"`
@@ -53,8 +47,6 @@ type StatusChange struct {
 	ChangedAt time.Time `json:"changed_at"`
 }
 
-// --- Request/Response DTOs ---
-
 type CreateOrderRequest struct {
 	CustomerID string      `json:"customer_id"`
 	Items      []OrderItem `json:"items"`
@@ -71,3 +63,29 @@ type CancelOrderRequest struct {
 type ErrorResponse struct {
 	Error string `json:"error"`
 }
+
+type ShippingWebhookEvent struct {
+	ShipmentID string `json:"shipment_id"`
+	OrderID    string `json:"order_id"`
+	EventType  string `json:"event_type"`
+	Status     string `json:"status"`
+	Details    string `json:"details,omitempty"`
+	Timestamp  int64  `json:"timestamp"`
+}
+
+type ShippingWebhookResponse struct {
+	OrderID         string `json:"order_id"`
+	ShipmentID      string `json:"shipment_id"`
+	PreviousStatus  string `json:"previous_status"`
+	NewStatus       string `json:"new_status"`
+	RefundTriggered bool   `json:"refund_triggered"`
+	Message         string `json:"message"`
+}
+
+const (
+	ShipStatusInTransit = "IN_TRANSIT"
+	ShipStatusDelivered = "DELIVERED"
+	ShipStatusLost      = "LOST"
+	ShipStatusDamaged   = "DAMAGED"
+	ShipStatusReturned  = "RETURNED"
+)
