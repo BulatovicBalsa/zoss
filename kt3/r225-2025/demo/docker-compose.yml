@@ -1,0 +1,67 @@
+services:
+  cassandra:
+    image: cassandra:4.1
+    container_name: ordering-cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      - CASSANDRA_CLUSTER_NAME=ordering-cluster
+      - CASSANDRA_DC=dc1
+      - CASSANDRA_RACK=rack1
+      - CASSANDRA_ENDPOINT_SNITCH=SimpleSnitch
+      - MAX_HEAP_SIZE=256M
+      - HEAP_NEWSIZE=64M
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'SELECT now() FROM system.local' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    networks:
+      - ordering-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: ordering-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 64mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ordering-net
+
+  ordering-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ordering-service
+    ports:
+      - "8080:8080"
+    environment:
+      - CASSANDRA_HOST=cassandra
+      - REDIS_ADDR=redis:6379
+      - MAX_PROCESSING_DELAY_MS=2000
+      - LOCK_TTL_MS=1000
+      - LISTEN_ADDR=:8080
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: on-failure
+    networks:
+      - ordering-net
+
+volumes:
+  cassandra-data:
+    driver: local
+
+networks:
+  ordering-net:
+    driver: bridge
