@@ -1,0 +1,65 @@
+--- webhook.go	2026-02-16 17:44:05.176872794 +0100
++++ webhook.go	2026-02-16 17:49:56.334657612 +0100
+@@ -4,49 +4,29 @@
+ 	"crypto/hmac"
+ 	"crypto/sha256"
+ 	"encoding/hex"
+-	"encoding/json"
+ 	"log"
+ )
+ 
+-type WebhookSignatureData struct {
+-	ShipmentID string `json:"shipment_id"`
+-	OrderID    string `json:"order_id"`
+-	EventType  string `json:"event_type"`
+-	Timestamp  int64  `json:"timestamp"`
+-}
+-
+-func computeWebhookHMAC(rawBody []byte, secret string) string {
+-	var sigData WebhookSignatureData
+-	if err := json.Unmarshal(rawBody, &sigData); err != nil {
+-		log.Printf("[webhook] Failed to unmarshal payload for HMAC: %v", err)
+-		return ""
+-	}
+-
+-	canonical, err := json.Marshal(sigData)
+-	if err != nil {
+-		log.Printf("[webhook] Failed to marshal canonical payload: %v", err)
+-		return ""
+-	}
+-
+-	log.Printf("[webhook] Canonical payload for HMAC: %s", string(canonical))
+-
++func VerifyWebhookSignature(rawBody []byte, signature, secret string) bool {
+ 	mac := hmac.New(sha256.New, []byte(secret))
+-	mac.Write(canonical)
+-	return hex.EncodeToString(mac.Sum(nil))
+-}
++	mac.Write(rawBody)
++	expected := mac.Sum(nil)
+ 
+-func VerifyWebhookSignature(rawBody []byte, signature, secret string) bool {
+-	computed := computeWebhookHMAC(rawBody, secret)
+-	if computed == "" {
++	sigBytes, err := hex.DecodeString(signature)
++	if err != nil {
++		log.Printf("[webhook] Invalid signature hex encoding: %v", err)
+ 		return false
+ 	}
+ 
+-	log.Printf("[webhook] Computed HMAC: %s", computed)
++	log.Printf("[webhook] Computed HMAC (over %d raw bytes): %s",
++		len(rawBody), hex.EncodeToString(expected))
+ 	log.Printf("[webhook] Provided HMAC: %s", signature)
+ 
+-	return computed == signature
++	return hmac.Equal(expected, sigBytes)
+ }
+ 
+ func SignWebhookPayload(rawBody []byte, secret string) string {
+-	return computeWebhookHMAC(rawBody, secret)
++	mac := hmac.New(sha256.New, []byte(secret))
++	mac.Write(rawBody)
++	return hex.EncodeToString(mac.Sum(nil))
+ }
+\ No newline at end of file
