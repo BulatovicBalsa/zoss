@@ -23,7 +23,7 @@ Zip Bomb je napad koji:
 Napad se manifestuje kroz sledeći obrazac:
 1. Napadač kreira zip bombu: mali tar.gz (kb) koji ekstraktuje više od 10GB fajlova (npr. rekurzivno duplirani fajlovi)
 2. Objavljuje kao crate v1.0.0 na alternate registry
-3. Modifikuje Cargo.toml Payment Adapter-
+3. Modifikuje Cargo.toml Payment Adapter-a
 4. Pokretanje ***cargo build***
 
 ## 4. Početna konfiguracija Payment Adapter-a
