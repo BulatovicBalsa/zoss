@@ -1,0 +1,32 @@
+@startuml
+title Ordering Service — arhitektura demo aplikacije
+
+skinparam backgroundColor #FEFEFE
+skinparam componentStyle rectangle
+
+actor "Kupac\n(HTTP klijent)" as user
+actor "Logistički\nprovajder" as lp
+
+package "Ordering Service (Go)" {
+    [Handlers\n(HTTP API)] as H
+    [State Machine\n(Redis Lock)] as SM
+    [Webhook Verify\n(HMAC-SHA256)] as WV
+    [OrderStore] as OS
+}
+
+database "Cassandra\n(podaci)" as C
+database "Redis\n(lockovi)" as R
+
+user --> H : REST API\n/orders/*
+lp --> H : Webhook\n/webhooks/shipping
+
+H --> SM : Transition()
+H --> WV : VerifyWebhookSignature()
+H --> OS : CreateOrder()\nGetOrder()
+
+SM --> OS : GetOrder()\nUpdateOrderStatus()
+SM --> R : SETNX / DEL
+
+OS --> C : CQL queries
+
+@enduml

@@ -1,0 +1,58 @@
+@startuml
+title Webhook Signature Bypass napad na Shipping podsistem
+
+skinparam backgroundColor #FEFEFE
+skinparam sequenceMessageAlign center
+
+actor "Logistički\nprovajder" as LP
+actor "Napadač\n(MITM)" as A
+participant "Ordering servis" as OS
+database "Cassandra" as C
+
+== 1. Priprema — porudžbina u SHIPPING stanju ==
+
+note over OS, C
+  Porudžbina O1 je u stanju SHIPPING
+  (prethodno kreirana, plaćena, poslana)
+end note
+
+== 2. Legitimni webhook ==
+
+LP -> A: Webhook P₁:\nstatus="IN_TRANSIT"\nsignature S
+note over A: Presreće P₁ i S
+
+A -> OS: Prosljeđuje P₁ + signature S
+OS -> OS: json.Unmarshal(P₁) → WebhookSignatureData\n(status polje se GUBI)
+OS -> OS: json.Marshal(struct) → canonical JSON\n(bez status polja)
+OS -> OS: HMAC(secret, canonical) == S ✓
+OS -> OS: status="IN_TRANSIT" → no state change
+OS --> A: 200 OK
+
+== 3. Napad — modifikovan payload ==
+
+note over A #ffcccc
+  Kreira P₂ = isti identitetski podaci
+  ali status="LOST"
+  Koristi ISTI potpis S
+end note
+
+A -> OS: Šalje P₂ + signature S
+OS -> OS: json.Unmarshal(P₂) → WebhookSignatureData\n(status polje se GUBI — isto kao P₁!)
+OS -> OS: json.Marshal(struct) → canonical JSON\n(identičan canonical kao za P₁)
+OS -> OS: HMAC(secret, canonical) == S ✓
+note over OS #ffcccc: Verifikacija prolazi jer\nstatus NIJE dio potpisa
+
+OS -> OS: status="LOST" → SHIPPING → SHIP_FAILED
+OS -> C: UPDATE status=SHIP_FAILED\nreason="shipment lost — refund initiated"
+OS -> OS: *** REFUND TRIGGERED ***
+OS --> A: 200 OK (refund_triggered=true)
+
+== Rezultat ==
+
+note over C #ffcccc
+  Porudžbina: SHIP_FAILED
+  Refund pokrenut za pošiljku koja je zapravo u tranzitu
+  Kupac dobija i proizvod i povrat novca
+end note
+
+@enduml
