@@ -4,7 +4,7 @@ Slike proizvoda se skladište u S3 bucket-u `catalog-images-zoss`
 
 Na slici je prikazan pregled bucket-a u okviru AWS naloga.
 
-![Amazon S3 – lista bucket-a](/images/aws-s3.png)
+![Amazon S3 – lista bucket-a](images/aws-s3.png)
 
 Bucket se nalazi u regionu `eu-north-1` i koristi se isključivo za čuvanje slika proizvoda.  
 Upload se ne vrši direktno putem javnog write pristupa, već preko pre-signed POST mehanizma koji generiše backend.
@@ -16,7 +16,7 @@ Upload se ne vrši direktno putem javnog write pristupa, već preko pre-signed P
 Upload token generiše posebna Lambda funkcija `presign-upload`.
 Na sledećoj slici prikazan je AWS Lambda panel sa listom funkcija sistema.
 
-![AWS Lambda – lista funkcija](/images/aws-lambda.png)
+![AWS Lambda – lista funkcija](images/aws-lambda.png)
 
 Funkcija `presign-upload` je odgovorna za generisanje pre-signed POST parametara.
 
