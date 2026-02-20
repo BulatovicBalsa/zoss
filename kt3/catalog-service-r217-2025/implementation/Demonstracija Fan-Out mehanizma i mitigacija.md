@@ -69,44 +69,36 @@ Poslato je više payload-ova u kratkom vremenskom periodu.
 Primer uzastopnih logova:
 
 ```text
-START RequestId: 929bb36a...
+2026-02-19T17:46:50.811Z
 Received JSON:
 {
   "sellerId": "s1",
   "productId": "p1",
-  "update": {
-    "price": 123.45
-  }
+  "update": { "price": 123.45 }
 }
 
-START RequestId: 3ef33b7c...
+2026-02-19T17:46:56.174Z
 Received JSON:
 {
   "sellerId": "s1",
   "productId": "p1",
-  "update": {
-    "price": 123.45
-  }
+  "update": { "price": 123.45 }
 }
 
-START RequestId: cb118918...
+2026-02-19T17:47:01.327Z
 Received JSON:
 {
   "sellerId": "s1",
   "productId": "p1",
-  "update": {
-    "price": 123.44
-  }
+  "update": { "price": 123.44 }
 }
 
-START RequestId: 9574f55e...
+2026-02-19T17:47:06.454Z
 Received JSON:
 {
   "sellerId": "s1",
   "productId": "p1",
-  "update": {
-    "price": 123.44
-  }
+  "update": { "price": 123.44 }
 }
 ```
 
@@ -114,12 +106,12 @@ Ukupno: 11 poruka → 11 invokacija po workeru.
 
 ### Rezultat
 
-| Worker          | Invocations |
-| --------------- | ----------- |
-| CacheWorker     | 11          |
-| IndexerWorker   | 11          |
-| AnalyticsWorker | 11          |
-| TOTAL           | 33          |
+|Worker|Invocations|
+|---|---|
+|CacheWorker|11|
+|IndexerWorker|11|
+|AnalyticsWorker|11|
+|TOTAL|33|
 
 # 2. SNS FIFO + Content-Based Deduplication
 
@@ -127,7 +119,8 @@ Ukupno: 11 poruka → 11 invokacija po workeru.
 
 ![CatalogEventsFIFO](images/catalog-events-fifo.png)
 
-Za razliku od prethodnog servisa, CatalogEvents.fifo koristi FIFO pristup sa ukljucenom content-based deduplikacijom
+Za razliku od prethodnog servisa, `CatalogEvents.fifo` koristi FIFO pristup sa uključenom content-based deduplikacijom.
+
 ## Bitna karakteristika
 
 - SNS koristi hash message body-a
@@ -136,9 +129,10 @@ Za razliku od prethodnog servisa, CatalogEvents.fifo koristi FIFO pristup sa ukl
 
 ## Log demonstracija (FIFO)
 
-Primeri primljenih poruka:
+Primeri primljenih poruka sa vremenskim oznakama:
 
 ```text
+2026-02-20T09:24:35.583Z
 Received JSON:
 {
   "sellerId": "s1",
@@ -146,6 +140,7 @@ Received JSON:
   "update": { "price": 123.45 }
 }
 
+2026-02-20T09:25:07.200Z
 Received JSON:
 {
   "sellerId": "s1",
@@ -153,6 +148,7 @@ Received JSON:
   "update": { "price": 123.44 }
 }
 
+2026-02-20T09:25:44.375Z
 Received JSON:
 {
   "sellerId": "s1",
@@ -160,19 +156,21 @@ Received JSON:
   "update": { "price": 123 }
 }
 
+2026-02-20T09:35:33.005Z
 Received JSON:
 {
   "sellerId": "s1",
   "productId": "p1",
-  "update": { "price": 12.45 }
+  "update": { "price": 123.45 }
 }
 ```
 
 Uočeno:
 
+- `price: 123.45` pojavljuje se dva puta.
+- Razmak između prvog i poslednjeg događaja je veći od 5 minuta.
+- Tokom 5-minutnog prozora identična poruka nije prosleđena.
 - Minimalna promena vrednosti (`123.45 → 123.44`) tretira se kao nova poruka.
-- Identična poruka unutar 5 minuta ne stiže do worker-a.
-- Nakon isteka 5 minuta, ista poruka (`price: 123.45`) ponovo prolazi.
 
 ### Rezultat
 
@@ -192,12 +190,19 @@ Ukupno: **18 invokacija**
 
 ![Agregirana arhitektura](images/Solution.png)
 
-Dodate komponente:
+### Dodate komponente
 
-- Aggregator Lambda - Svaki zahtev koji prodje SNS FIFO biva smesten u DynamoDB privremenu bazu radi agregacije podataka
-- DynamoDB tabela
-- Flush Timer (5 minuta) - Nakon isteka timer-a, Flusher lambda sakuplja sve nove promene i prosledjuje ih dalje na obradu
-- Flusher Lambda
+**1. Aggregator Lambda**  
+Svaki događaj koji prođe SNS FIFO upisuje se u DynamoDB tabelu radi privremene agregacije.
+
+**2. DynamoDB tabela**  
+Služi kao privremeno skladište promena po ključu `(sellerId, productId)`.
+
+**3. Flush Timer (EventBridge – 5 minuta)**  
+Periodički aktivira Flusher Lambda funkciju.
+
+**4. Flusher Lambda**  
+Čita agregirane promene iz DynamoDB, formira objedinjeni događaj i šalje ga nazad na SNS radi fan-out distribucije.
 
 ## Rezultat agregacije
 
@@ -222,14 +227,14 @@ Primer:
 
 ### Invokacije
 
-| Worker          | Invocations |
-| --------------- | ----------- |
-| CacheWorker     | 1           |
-| IndexerWorker   | 1           |
-| AnalyticsWorker | 1           |
-| Aggregator      | 4           |
+|Worker|Invocations|
+|---|---|
+|CacheWorker|1|
+|IndexerWorker|1|
+|AnalyticsWorker|1|
+|Aggregator|4|
 
-Ukupno: **9 invokacija**
+Ukupno: **7 invokacija**
 
 ---
 
@@ -245,22 +250,14 @@ Ukupno: **9 invokacija**
 | Aggregator       | 0     | 0    | 4      |
 | CatalogEventsSNS | 11    | 11   | 11     |
 
----
-
 ## Ukupan broj Lambda invokacija
 
-|Scenario|Total|
-|---|---|
-|Naive|33|
-|FIFO|18|
-|Digest|9|
-
----
+| Scenario | Total |
+| -------- | ----- |
+| Naive    | 33    |
+| FIFO     | 18    |
+| Digest   | 7     |
 
 ## Vizuelni prikaz
 
-```
-Naive   : █████████████████████████████ (33)
-FIFO    : ████████████████              (18)
-Digest  : ████████                      (9)
-```
+![Chart](images/chart.png)
