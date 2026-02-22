@@ -6,12 +6,13 @@
 
 ## Pregled
 
-Ovaj direktorijum sadrži bezbjednosnu analizu i demonstraciju dva napada na Temu marketplace platformu:
+Ovaj direktorijum sadrži bezbjednosnu analizu i demonstraciju tri napada na Temu marketplace platformu:
 
 | # | Podsistem | Napad | Folder |
 |---|-----------|-------|--------|
 | 1 | **Ordering** | Race Condition na State Machine (non-owner-aware Redis lock) | [`ordering/`](ordering/) |
 | 2 | **Shipping & Logistics** | Webhook Signature Bypass (JSON canonicalization flaw) | [`shipping/`](shipping/) |
+| 3 | **Shipping & Logistics (v2)** | Protobuf JSON DoS (CVE-2024-24786, `protojson.Unmarshal`) | [`shipping-v2-protobuf/`](shipping-v2-protobuf/) |
 
 Zajednička demo aplikacija se nalazi u [`demo/`](demo/) folderu.
 
@@ -43,6 +44,7 @@ Servis je dostupan na `http://localhost:8080`.
 | `POST` | `/orders/{orderID}/ship` | Iniciranje slanja (PAID → SHIPPING) |
 | `GET` | `/orders/{orderID}/history` | Istorija statusa |
 | `POST` | `/webhooks/shipping` | Webhook za status pošiljke |
+| `POST` | `/webhooks/shipping/v2` | Webhook v2 (protobuf-json envelope) |
 | `GET` | `/health` | Health check |
 
 ---
@@ -78,6 +80,23 @@ chmod +x attack.sh
 ```
 
 **Mitigacija**: Raw-byte HMAC verifikacija nad kompletnim payload-om + konstantno-vremensko poređenje. Detalji u [`shipping/README.md`](shipping/README.md).
+
+---
+
+## Napad 3: Protobuf JSON DoS na Shipping v2 webhook (CVE-2024-24786)
+
+**Folder**: [`shipping-v2-protobuf/`](shipping-v2-protobuf/)
+
+**Ranjivost**: Interni JSON dekoder u `google.golang.org/protobuf` (`protojson.Unmarshal`) u verzijama `< 1.33.0` sadrži bug u obradi malformed JSON-a: payload `{"":}` (objekat sa praznim ključem i nedostajućom vrijednošću) izaziva beskonačnu petlju u `skipJSONValue()` funkciji kada je `DiscardUnknown=true`. Svaki napadački zahtjev trajno zarobljava goroutinu na 100% CPU — 5 konkurentnih zahtjeva zasićuje servis na ~600% CPU. Endpoint `/webhooks/shipping/v2` koristi Protobuf JSON (`google.protobuf.Any` envelope) za standardizovanu integraciju sa eksternim logističkim provajderima, a upravo `DiscardUnknown` mehanizam (ključan za kompatibilnost sa raznolikim provajderima) aktivira ranjivu granu izvrsavanja.
+
+**Demonstracija**:
+```bash
+cd shipping-v2-protobuf
+chmod +x attack.sh
+./attack.sh http://localhost:8080
+```
+
+**Mitigacija**: Upgrade protobuf biblioteke na `v1.33.0+` (fix u dekoderu i `skipJSONValue()`) i defense-in-depth postavljanje `DiscardUnknown=false`. Detalji u [`shipping-v2-protobuf/README.md`](shipping-v2-protobuf/README.md).
 
 ---
 

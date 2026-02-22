@@ -1,0 +1,27 @@
+--- go.mod	2026-02-22 21:33:49.889557493 +0100
++++ go.mod	2026-02-22 21:33:49.892624109 +0100
+@@ -7,7 +7,7 @@
+ 	github.com/gocql/gocql v1.6.0
+ 	github.com/google/uuid v1.6.0
+ 	github.com/redis/go-redis/v9 v9.5.1
+-	google.golang.org/protobuf v1.32.0
++	google.golang.org/protobuf v1.33.0
+ )
+ 
+ require (
+--- handlers.go	2026-02-22 21:33:49.890557427 +0100
++++ handlers.go	2026-02-22 21:33:49.893557224 +0100
+@@ -305,11 +305,10 @@
+ 
+ 	log.Printf("[webhook-v2] Signature verification PASSED")
+ 
+-	// Intentionally vulnerable parser path for CVE-2024-24786 demo:
+-	// protojson.Unmarshal with DiscardUnknown on older protobuf versions.
++	// Patched: strict parsing path + fixed protobuf version.
+ 	var envelope anypb.Any
+ 	unmarshalOpts := protojson.UnmarshalOptions{
+-		DiscardUnknown: true,
++		DiscardUnknown: false,
+ 	}
+ 	if err := unmarshalOpts.Unmarshal(rawBody, &envelope); err != nil {
+ 		log.Printf("[webhook-v2] Failed to parse protobuf-JSON envelope: %v", err)

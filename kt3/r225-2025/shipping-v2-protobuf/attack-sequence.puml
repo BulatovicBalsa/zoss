@@ -1,0 +1,133 @@
+@startuml
+!theme plain
+
+title CVE-2024-24786 — Protobuf JSON DoS napad na Shipping Webhook v2
+
+actor "Napadač" as Attacker
+participant "Ordering Service\n/webhooks/shipping/v2" as Service
+participant "VerifyWebhookSignatureRaw()\nHMAC-SHA256" as HMAC
+participant "protojson.Unmarshal()\nDiscardUnknown=true\n(v1.32.0 — ranjivo)" as Parser
+participant "skipJSONValue()\ninternal/encoding/json" as SkipFn
+database "Cassandra\n(orders)" as DB
+
+== Priprema — legitimni tok (kontrolni korak) ==
+
+Attacker -> Service: POST /webhooks/shipping/v2\n{validni protobuf-JSON envelope}\nX-Webhook-Signature: <HMAC>
+Service -> HMAC: VerifyWebhookSignatureRaw(rawBody, sig, secret)
+HMAC --> Service: true
+Service -> Parser: Unmarshal(rawBody, &envelope)
+Parser --> Service: ok
+Service -> DB: UpdateOrderStatus(IN_TRANSIT)
+Service --> Attacker: HTTP 200 OK
+
+== Napad — CVE-2024-24786 trigger ==
+
+Attacker -> Service: POST /webhooks/shipping/v2\n**{"":}**\nX-Webhook-Signature: <HMAC>
+note right of Attacker
+  Payload: {"":}
+  JSON objekat sa praznim ključem
+  i nedostajućom vrijednošću.
+  HMAC je validan jer se računa
+  nad sirovim bajtovima.
+end note
+
+Service -> HMAC: VerifyWebhookSignatureRaw(rawBody, sig, secret)
+HMAC --> Service: true (HMAC je ispravan)
+
+Service -> Parser: Unmarshal(rawBody, &envelope)\nDiscardUnknown=true
+
+Parser -> Parser: Read() → ObjectOpen "{"
+Parser -> Parser: Read() → Name ""
+note right of Parser
+  Parser pročita "" kao ime polja.
+  Polje "" nije poznato u Any poruci.
+  DiscardUnknown=true → poziva se
+  skipJSONValue() da preskoči
+  vrijednost nepoznatog polja.
+end note
+
+Parser -> SkipFn: skipJSONValue()
+note right of SkipFn
+  **BUG u v1.32.0:**
+  Dekoder čita "}" token.
+  U ranjivoj verziji, "}" nakon
+  Name tokena NIJE prepoznat
+  kao greška — provjera je samo:
+    lastToken.kind == comma
+  umjesto ispravnog:
+    lastToken.kind & (Name|comma) != 0
+
+  skipJSONValue() dobija EOF token
+  ali NEMA case za EOF →
+  nastavlja petlju beskonačno.
+end note
+
+loop Beskonačna petlja (CPU 100%)
+  SkipFn -> SkipFn: Read() → EOF\n(nema case za EOF,\nnastavlja petlju)
+end
+
+note over Service
+  Handler goroutina je zarobljena
+  u beskonačnoj petlji.
+  Ne vraća HTTP odgovor.
+  CPU jezgro zasićeno na 100%.
+end note
+
+Attacker --> Service: curl timeout (nema odgovora)
+
+== Konkurentni DoS — eskalacija ==
+
+Attacker -> Service: 5× POST {"":}\n(konkurentno)
+note right of Service
+  Svaki zahtjev zarobljava
+  jednu goroutinu u beskonačnoj
+  petlji. 5 zahtjeva = 5 jezgara
+  na 100% CPU (~600% ukupno).
+
+  Goroutine se NE oslobađaju
+  čak ni nakon client disconnect-a
+  jer protojson ne provjerava
+  context cancellation.
+end note
+
+Service --> Attacker: Svih 5 zahtjeva timeout-uje
+
+== Stanje nakon napada ==
+
+note over Service, DB
+  Servis je i dalje aktivan (health check prolazi)
+  ali sa značajno degradiranim performansama.
+  Zarobljene goroutine nastavljaju trošiti CPU
+  sve do restarta procesa.
+end note
+
+== Mitigacija — patchovano ponašanje (v1.33.0+) ==
+
+Attacker -> Service: POST /webhooks/shipping/v2\n**{"":}**\nX-Webhook-Signature: <HMAC>
+Service -> HMAC: VerifyWebhookSignatureRaw(rawBody, sig, secret)
+HMAC --> Service: true
+
+Service -> Parser: Unmarshal(rawBody, &envelope)\nDiscardUnknown=false
+Parser -> Parser: Read() → ObjectOpen "{"
+Parser -> Parser: Read() → Name ""
+Parser -> Parser: Read() → ObjectClose "}"
+note right of Parser
+  **FIX u v1.33.0:**
+  1. Dekoder prepoznaje "}" nakon
+     Name kao grešku:
+       lastToken.kind & (Name|comma) != 0
+     → syntax error: unexpected token }
+
+  2. skipJSONValue() ima case za EOF:
+       case json.EOF:
+         return errors.New("unexpected EOF")
+     → dodatna zaštita od petlje
+
+  3. DiscardUnknown=false odbija
+     nepoznata polja odmah.
+end note
+Parser --> Service: error: syntax error\n(line 1:5): unexpected token }
+
+Service --> Attacker: **HTTP 400** Bad Request\n{"error":"invalid protobuf-json envelope"}\n(odgovor za <1ms)
+
+@enduml
