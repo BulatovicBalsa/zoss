@@ -6,7 +6,7 @@
 
 ## 1. Uvod
 
-`smallvec` je široko korišćena Rust kreta optimizovana za efikasno upravljanje malim vektorima — koristi inline stack storage za niz koji staje u inline kapacitet, a pri prekoračenju prelazi na heap alokaciju (*spilling*). Koristi se u Servo (Mozilla browser engine), Tokio async runtime-u i brojnim kritičnim komponentama Rust ekosistema.
+`smallvec` je široko korišćena Rust biblioteka optimizovana za efikasno upravljanje malim vektorima. Koristi inline stack storage za niz koji staje u inline kapacitet, a pri prekoračenju prelazi na heap alokaciju (*spilling*). Koristi se u Servo (Mozilla browser engine), Tokio async runtime-u i brojnim kritičnim komponentama Rust ekosistema.
 
 **Ranjivost**: **RUSTSEC-2019-0012 / CVE-2019-15554 / CVE-2019-15551** (CVSS **9.8 CRITICAL**). Funkcija `SmallVec::grow()` ne validira relaciju između prosleđenog `new_cap` i trenutnog kapaciteta vektora nakon *spill*-a na heap. Ovo omogućava dva distinktna scenarija memorijske korupcije:
 
@@ -19,10 +19,12 @@
 Stripe Webhook → Payment Adapter → smallvec deserializacija → grow() korupcija → crash
 ```
 
+![smallvec-memory-corruption](images/smallvec-memory-coruption.png)
+
 
 Napadač koji kontroliše input koji prolazi kroz `SmallVec::grow()` može eksploatisati ovu ranjivost radi dobijanja sadržaja memorije ili postizanja remote code execution-a.
 
-Ovaj dokument opisuje ranjivost non-atomic `grow()` operacije u `smallvec` krati, demonstrira eksploataciju putem direktnih `grow()` poziva sa kontrolisanim argumentima, i prikazuje mitigaciju update-om na patched verziju.
+Ovaj dokument opisuje ranjivost non-atomic `grow()` operacije u `smallvec` biblioteka, demonstrira eksploataciju putem direktnih `grow()` poziva sa kontrolisanim argumentima, i prikazuje mitigaciju update-om na patched verziju.
 
 ---
 
@@ -33,7 +35,7 @@ Ovaj dokument opisuje ranjivost non-atomic `grow()` operacije u `smallvec` krati
 | STRIDE kategorija | Primjenljivost | Obrazloženje |
 |---|---|---|
 | **Tampering** | Da | Napadač korumpira heap metadata kroz kontrolisani `grow()` poziv, mijenjajući ponašanje heap alokatora i potencijalno sadržaj memorije. |
-| **Denial of Service** | Da | Heap corruption uzrokuje server panic — Payment Adapter pada i plaćanja su zaustavljena. |
+| **Denial of Service** | Da | Heap corruption uzrokuje server panic. Payment Adapter pada i plaćanja su zaustavljena. |
 | **Elevation of Privilege** | Da | Heap overflow i use-after-free mogu omogućiti arbitrary code execution u realnom eksploit scenariju. |
 | **Information Disclosure** | Da | Use-after-free čitanje iz oslobođene memorije može otkriti sadržaj heap-a (npr. kriptografski ključevi, payment podaci). |
 | **Spoofing** | Ne | Napad ne zahtijeva lažno predstavljanje. |
@@ -41,19 +43,19 @@ Ovaj dokument opisuje ranjivost non-atomic `grow()` operacije u `smallvec` krati
 
 ### 2.2 CWE referenca
 
-- **CWE-416: Use After Free** — double-free u `grow(capacity)` scenariju (CVE-2019-15551): `grow()` oslobađa stari buffer, `drop()` pokušava osloboditi isti pokazivač drugi put.
-- **CWE-787: Out-of-bounds Write** — OOB write u `grow(n < capacity)` scenariju (CVE-2019-15554): reallokacija na manji buffer uz zadržavanje originalnog `len` vrijednosti.
-- **CWE-122: Heap-based Buffer Overflow** — pisanje elemenata izvan opsega realociranog heap buffera.
+- **CWE-416: Use After Free** - double-free u `grow(capacity)` scenariju (CVE-2019-15551): `grow()` oslobađa stari buffer, `drop()` pokušava osloboditi isti pokazivač drugi put.
+- **CWE-787: Out-of-bounds Write** - OOB write u `grow(n < capacity)` scenariju (CVE-2019-15554): reallokacija na manji buffer uz zadržavanje originalnog `len` vrijednosti.
+- **CWE-122: Heap-based Buffer Overflow** - pisanje elemenata izvan opsega realociranog heap buffera.
 
 ### 2.3 Opis pretnje
 
 `SmallVec::grow()` sadrži dvije distinct ranjivosti koje se aktiviraju različitim vrijednostima argumenta kada je vektor u *spilled* stanju (na heap-u):
 
-**Scenario 1 — CVE-2019-15554 (heap metadata corruption)**:
-Kada se `grow(n)` pozove sa `len ≤ n < capacity`, funkcija vrši `realloc` na **manji** heap buffer, ali interni `len` ostaje nepromijenjen. Svaki naredni push koji pristupa indeksu između novog i starog kapaciteta vrši OOB write u heap chunk metadata susjednog bloka, korumpujući malloc-ove internu strukturu.
+**Scenario 1 - CVE-2019-15554 (heap metadata corruption)**:
+Kada se `grow(n)` pozove sa `len ≤ n < capacity`, funkcija vrši `realloc` na **manji** heap buffer, ali interni `len` ostaje nepromijenjen. Svaki naredni push koji pristupa indeksu između novog i starog kapaciteta vrši OOB write u heap chunk metadata susjednog bloka, korumpirajući malloc-ove internu strukturu.
 
-**Scenario 2 — CVE-2019-15551 (double-free)**:
-Kada se `grow(n)` pozove sa `n == capacity`, funkcija dealocira stari `Vec` buffer (1. `free` na adresi `0x4aab380`), alocira novi buffer iste veličine i kopira podatke. Međutim, interni `Vec` wrapper zadržava stari pokazivač. Kada scope završi i destruktor se poziva, `Drop::drop` (lib.rs:1402) pokušava osloboditi isti, već oslobođeni blok (2. `free`) — **double-free**.
+**Scenario 2 - CVE-2019-15551 (double-free)**:
+Kada se `grow(n)` pozove sa `n == capacity`, funkcija dealocira stari `Vec` buffer (1. `free` na adresi `0x4aab380`), alocira novi buffer iste veličine i kopira podatke. Međutim, interni `Vec` wrapper zadržava stari pokazivač. Kada scope završi i destruktor se poziva, `Drop::drop` pokušava osloboditi isti, već oslobođeni blok (2. `free`) **double-free**.
 
 Ključni problem: `grow()` ne sadrži provjeru `assert!(new_cap >= self.capacity())` za *spilled* vektore.
 
@@ -65,23 +67,23 @@ Ključni problem: `grow()` ne sadrži provjeru `assert!(new_cap >= self.capacity
 
 Primarni afektovani resurs. Heap korupcija narušava:
 
-- **Malloc metadata** — next/prev chunk pokazivači u heap alocatoru postaju nevalidni nakon OOB write-a.
-- **Server stabilnost** — double-free uzrokuje abort signal ili nedefinisano ponašanje pri narednoj heap operaciji.
-- **Payment processing pipeline** — adapter pada, Stripe webhook-ovi se ne procesuju, plaćanja su blokirana.
+- **Malloc metadata** - next/prev chunk pokazivači u heap alocatoru postaju nevalidni nakon OOB write-a.
+- **Server stabilnost** - double-free uzrokuje abort signal ili nedefinisano ponašanje pri narednoj heap operaciji.
+- **Payment processing pipeline** - adapter pada, Stripe webhook-ovi se ne procesuju, plaćanja su blokirana.
 
 **CIA triada**: Integritet i dostupnost kompromitovani.
 
-### 3.2 Payment Adapter podaci — INTEGRITET
+### 3.2 Payment Adapter podaci - INTEGRITET
 
-Malformed heap stanje može uzrokovati neispravno parsiranje payment event-a — npr. `succeeded` status se čita iz korumpirane memorije kao `failed`, što pokreće lažni refund proces.
+Malformed heap stanje može uzrokovati neispravno parsiranje payment event-a, npr. `succeeded` status se čita iz korumpirane memorije kao `failed`, što pokreće lažni refund proces.
 
 **Poslovni uticaj**: Direktan finansijski gubitak i kršenje PCI DSS integriteta transakcija.
 
-### 3.3 Kriptografski materijal — POVJERLJIVOST
+### 3.3 Kriptografski materijal - POVJERLJIVOST
 
-Use-after-free čitanje iz oslobođenih heap blokova može izložiti sadržaj koji je prethodno bio na toj adresi — potencijalno HMAC ključevi, session token-i ili payment card metadata.
+Use-after-free čitanje iz oslobođenih heap blokova može izložiti sadržaj koji je prethodno bio na toj adresi, potencijalno HMAC ključevi, session token-i ili payment card metadata.
 
-### 3.4 Audit logovi — DOSTUPNOST
+### 3.4 Audit logovi - DOSTUPNOST
 
 Server crash prekida aktivne konekcije i može uzrokovati gubitak in-flight log event-a koji nisu flush-ovani na disk.
 
@@ -97,7 +99,7 @@ Napadač je **eksterni akter** koji:
 - Razumije da `smallvec::grow()` ne validira `new_cap < capacity`
 - Može konstruisati payload koji forsira `grow()` poziv sa kontrolisanom vrijednosti
 
-Napadač ne mora posjedovati privilegovani pristup — webhook endpoint je dostupan eksternim provajderima (npr. Stripe).
+Napadač ne mora posjedovati privilegovani pristup. Webhook endpoint je dostupan eksternim provajderima (npr. Stripe).
 
 ### 4.2 Preduslovi
 
@@ -130,7 +132,7 @@ Napadač ne mora posjedovati privilegovani pristup — webhook endpoint je dostu
 
 ### 5.1 Ranjivi kod — `smallvec/lib.rs`
 
-Ključna ranjivost je u `SmallVec::grow()` funkciji (lib.rs:658–668):
+Ključna ranjivost je u `SmallVec::grow()` funkciji:
 
 ```rust
 // RANJIVO: lib.rs:658-668 (smallvec 0.6.9)
