@@ -56,7 +56,7 @@ GB --> A: 200 OK (CANCELLED)
 
 note over C #ffcccc
   Baza: status=CANCELLED (last-write-wins)
-  Historija: PENDING_PAYMENT→PAID i PENDING_PAYMENT→CANCELLED
+  Istorija: PENDING_PAYMENT→PAID i PENDING_PAYMENT→CANCELLED
   Oba zahtjeva vratila HTTP 200 — state machine prekršen
 end note
 

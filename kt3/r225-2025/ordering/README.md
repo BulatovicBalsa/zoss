@@ -32,7 +32,7 @@ Ovaj dokument opisuje ranjivost non-owner-aware Redis lock-a, demonstrira eksplo
 |---|---|---|
 | **Tampering** |  Da | Napadač manipuliše stanjem porudžbine, dovodeći sistem u nekonzistentno stanje. |
 | **Elevation of Privilege** |  Da | Napadač postiže ishod koji ne bi smio biti moguć (npr. otkazana porudžbina za koju je plaćanje izvršeno). |
-| **Repudiation** |  Da | Status historija bilježi dvije tranzicije iz istog izvornog stanja, što je nemoguća sekvenca u ispravnom sistemu. Forenzika ne može pouzdano utvrditi koji zahtjev je bio "pravi". |
+| **Repudiation** |  Da | Istorija statusa bilježi dvije tranzicije iz istog izvornog stanja, što je nemoguća sekvenca u ispravnom sistemu. Forenzika ne može pouzdano utvrditi koji zahtjev je bio "pravi". |
 | **Information Disclosure** |  Ne | Napad ne dovodi do curenja podataka. |
 | **Denial of Service** |  Ne | Sistem nastavlja da funkcioniše — problem je u integritetu, ne u dostupnosti. |
 | **Spoofing** |  Ne | Napadač koristi sopstveni legitimni nalog. |
@@ -60,7 +60,7 @@ Ključni problem: **lock vrijednost ne nosi informaciju o vlasništvu**, pa klij
 Primarni afektovani resurs. Race condition direktno narušava integritet podataka o porudžbini:
 
 - **Status porudžbine** postaje nekonzistentan sa stvarnim stanjem poslovnog procesa. Porudžbina može istovremeno biti i "plaćena" (Payment servis dobio potvrdu) i "otkazana" (kupac dobio potvrdu otkazivanja), dok baza čuva samo jedan od ta dva statusa — koji zavisi od toga čiji upis je stigao posljednji.
-- **Status istorije** bilježi nemoguću sekvencu: dva zapisa sa istim izvornim stanjem (`PENDING_PAYMENT → PAID` i `PENDING_PAYMENT → CANCELLED`), što ukazuje da je state machine prekršen.
+- **Istorija statusa** bilježi nemoguću sekvencu: dva zapisa sa istim izvornim stanjem (`PENDING_PAYMENT → PAID` i `PENDING_PAYMENT → CANCELLED`), što ukazuje da je state machine prekršen.
 - **Životni ciklus porudžbine** postaje nepredvidiv — dalji procesi (shipping, refund) se mogu pokrenuti na osnovu pogrešnog stanja.
 
 **CIA triada**: Integritet je kompromitovan. Dostupnost nije ugrožena. Poverljivost nije afektovana.
@@ -77,7 +77,7 @@ Sekundarni afektovani resurs. Ako Payment servis primi potvrdu da je tranzicija 
 
 ### 3.3 Audit logovi — NEPORICANJE
 
-Status historija (tabela `order_status_history`) bilježi obje tranzicije kao uspješne. Sa stanovišta forenzike, sistem prikazuje nemoguću putanju. Dva prelaza iz istog izvornog stanja narušavaju pouzdanost audit trail-a i otežavaju dispute resolution.
+Istorija statusa (tabela `order_status_history`) bilježi obje tranzicije kao uspješne. Sa stanovišta forenzike, sistem prikazuje nemoguću putanju. Dva prelaza iz istog izvornog stanja narušavaju pouzdanost audit trail-a i otežavaju dispute resolution.
 
 ### 3.4 Customer Data — INTEGRITET
 
@@ -226,7 +226,98 @@ docker compose up -d ordering-service
 
 ---
 
-## 8. Demonstracija mitigacije
+## 8. Analiza logova aplikacije
+
+### 8.1 Logovi u ranjivom stanju (prije patch-a)
+
+#### RACE ishod — oba zahtjeva uspjela (delay > TTL)
+
+```
+[handler] Created order f7ee40a2-...: customer=lograce_1 (total=49.99)
+[state]   Order f7ee40a2-...: lock acquired (value="1", TTL=1s)          ← PAY zauzima lock
+[state]   Order f7ee40a2-...: processing (1.520s delay)...               ← delay (1.52s) > TTL (1s)
+                                                                          ← lock ISTEKAO nakon 1s, PAY još obrađuje
+[state]   Order f7ee40a2-...: lock acquired (value="1", TTL=1s)          ← CANCEL zauzima NOVI lock (SETNX uspijeva jer je TTL istekao)
+[state]   Order f7ee40a2-...: processing (252ms delay)...                ← CANCEL obrađuje sa kratkim delay-em
+[state]   Order f7ee40a2-...: PENDING_PAYMENT → PAID COMMITTED          ← PAY upisuje — NE provjerava vlasništvo
+[state]   Order f7ee40a2-...: lock released (DEL)                        ← PAY briše CANCEL-ov lock (bezuslovni DEL)!
+[handler] Order f7ee40a2-... marked as PAID (payment_id=pay_1)
+[state]   Order f7ee40a2-...: PENDING_PAYMENT → CANCELLED COMMITTED     ← CANCEL upisuje — lock je obrisan, nema zaštite
+[state]   Order f7ee40a2-...: lock released (DEL)                        ← CANCEL poziva DEL na već obrisanom lock-u (no-op)
+[handler] Order f7ee40a2-... CANCELLED (reason: cancel 1)
+```
+
+Oba zahtjeva su izvršila `COMMITTED` iz istog izvornog stanja (`PENDING_PAYMENT`). Istorija porudžbine sada sadrži dva zapisa — `PENDING_PAYMENT → PAID` i `PENDING_PAYMENT → CANCELLED` — što je nemoguća sekvenca u ispravnom state machine-u. Problem nastaje jer:
+
+1. PAY-ov lock istekne tokom obrade (delay 1.52s > TTL 1s)
+2. CANCEL zauzme novi lock sa istom statičkom vrijednošću `"1"`
+3. PAY završi obradu i pozove `DEL` — briše CANCEL-ov lock jer `DEL` ne provjerava vlasništvo
+4. CANCEL završi obradu bez ikakve zaštite (lock je već obrisan)
+
+#### OK ishod — jedan zahtjev uspio (delay < TTL)
+
+```
+[handler] Created order b352ba03-...: customer=oktest_3 (total=49.99)
+[state]   Order b352ba03-...: lock acquired (value="1", TTL=1s)          ← PAY zauzima lock
+[state]   Order b352ba03-...: processing (55ms delay)...                 ← delay (55ms) << TTL (1s)
+[state]   Order b352ba03-...: PENDING_PAYMENT → PAID COMMITTED          ← PAY upisuje dok lock još važi
+[state]   Order b352ba03-...: lock released (DEL)                        ← PAY oslobađa SVOJ lock (ispravno)
+[handler] Order b352ba03-... marked as PAID (payment_id=pay_ok_3)
+[state]   Order b352ba03-...: lock acquired (value="1", TTL=1s)          ← CANCEL zauzima lock
+                                                                          ← CANCEL čita status: PAID (ažurirano)
+[state]   Order b352ba03-...: lock released (DEL)                        ← tranzicija PAID→CANCELLED nije dozvoljena, lock se oslobađa
+```
+
+Kada je delay < TTL, PAY završi obradu i oslobodi lock prije isteka. CANCEL zauzme lock, pročita ažurirano stanje (`PAID`), i tranzicija `PAID → CANCELLED` nije dozvoljena — state machine radi ispravno. Ranjivost se manifestuje samo kada delay > TTL.
+
+---
+
+### 8.2 Logovi u patchovanom stanju (poslije patch-a)
+
+#### SAFE ishod — oba zahtjeva odbijena (delay > TTL, ownership detektovan)
+
+```
+[handler] Created order ba486437-...: customer=safe_test_1 (total=49.99)
+[state]   Order ba486437-...: lock acquired (owner=311d01f2, TTL=1s)     ← PAY zauzima lock sa UUID 311d01f2...
+[state]   Order ba486437-...: processing (1.100s delay)...               ← delay (1.1s) > TTL (1s)
+                                                                          ← lock ISTEKAO nakon 1s
+[state]   Order ba486437-...: lock acquired (owner=1cf03512, TTL=1s)     ← CANCEL zauzima NOVI lock sa DRUGIM UUID-em 1cf03512...
+[state]   Order ba486437-...: processing (1.628s delay)...               ← CANCEL obrađuje
+[state]   Order ba486437-...: lock stolen (expected=311d01f2, found=1cf03512), aborting  ← PAY detektuje da lock više nije NJEGOV
+[state]   Order ba486437-...: lock NOT released (ownership lost)         ← PAY NE briše tuđi lock (Lua skripta provjerava UUID)
+                                                                          ← CANCEL-ov lock istekne (delay 1.628s > TTL 1s)
+[state]   Order ba486437-...: lock expired during processing, aborting   ← CANCEL detektuje istek SVOG lock-a
+[state]   Order ba486437-...: lock NOT released (ownership lost)         ← CANCEL NE briše (lock već istekao)
+```
+
+Nijedan zahtjev nije upisao promjenu stanja. Oba su detektovala gubitak vlasništva i odbila upis:
+
+1. PAY detektuje da je lock ukraden — `GET` vraća UUID `1cf03512` umjesto očekivanog `311d01f2` → `ErrLockExpired`
+2. CANCEL detektuje da je lock istekao — `GET` vraća `redis.Nil` → `ErrLockExpired`
+3. Lua skripta za release sprečava brisanje tuđeg lock-a — `DEL` se izvršava samo ako `GET == ARGV[1]`
+
+Porudžbina ostaje u `PENDING_PAYMENT` stanju — ovo je **fail-safe** ponašanje. Korisnik može ponovo pokušati operaciju.
+
+#### OK ishod — jedan zahtjev uspio (delay < TTL, ownership verifikovan)
+
+```
+[handler] Created order 70546fc4-...: customer=ok_fix_3 (total=49.99)
+[state]   Order 70546fc4-...: lock acquired (owner=3648301b, TTL=1s)     ← PAY zauzima lock sa UUID 3648301b...
+[state]   Order 70546fc4-...: processing (411ms delay)...                ← delay (411ms) < TTL (1s)
+                                                                          ← ownership check: GET lock → 3648301b == 3648301b ✓
+[state]   Order 70546fc4-...: PENDING_PAYMENT → PAID COMMITTED          ← PAY upisuje — vlasništvo verifikovano
+[state]   Order 70546fc4-...: lock released (owner verified)             ← Lua skripta: GET == UUID → DEL (ispravno oslobođen)
+[handler] Order 70546fc4-... marked as PAID (payment_id=pay_f_3)
+[state]   Order 70546fc4-...: lock acquired (owner=e9787577, TTL=1s)     ← CANCEL zauzima lock
+                                                                          ← CANCEL čita status: PAID (ažurirano)
+[state]   Order 70546fc4-...: lock released (owner verified)             ← tranzicija PAID→CANCELLED nije dozvoljena
+```
+
+PAY provjerava vlasništvo prije upisa (`GET lock == UUID`), potvrđuje da je lock još uvijek njegov, i upisuje. Lua skripta za release verifikuje UUID prije brisanja. CANCEL zauzme lock, pročita ažurirano stanje (`PAID`), i biva odbijen jer tranzicija `PAID → CANCELLED` nije dozvoljena.
+
+---
+
+## 9. Demonstracija mitigacije
 
 ```bash
 ./attack.sh http://localhost:8080 20
