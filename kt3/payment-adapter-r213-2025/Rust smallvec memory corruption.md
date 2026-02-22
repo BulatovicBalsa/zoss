@@ -1,4 +1,4 @@
-# KT3 — Memory Corruption napad na Rust `smallvec` komponentu
+# Memory Corruption napad na Rust `smallvec` komponentu
 
 ###### Teodor Vidaković, R213/2025
 

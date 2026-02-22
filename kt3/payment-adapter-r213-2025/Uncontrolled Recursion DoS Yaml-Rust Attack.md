@@ -1,4 +1,4 @@
-# KT3 — Uncontrolled Recursion DoS napad na `yaml-rust` komponentu
+# Uncontrolled Recursion DoS napad na `yaml-rust` komponentu
 
 ###### Teodor Vidaković, R213/2025
 

@@ -1,4 +1,4 @@
-# KT3 — Use-After-Free napad na `rust-openssl` biblioteku
+# Use-After-Free napad na `rust-openssl` biblioteku
 
 ###### Teodor Vidaković, R213/2025
 
