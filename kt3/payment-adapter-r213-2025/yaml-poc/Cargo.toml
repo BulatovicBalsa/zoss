@@ -1,0 +1,9 @@
+[package]
+name = "yaml-poc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+yaml-rust = "=0.4.0"   # VULNERABLE: RUSTSEC-2018-0006, fixed u 0.4.1
+#yaml-rust = "=0.4.5" #PATCHED
+
