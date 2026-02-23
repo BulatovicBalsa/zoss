@@ -50,3 +50,16 @@ func VerifyWebhookSignature(rawBody []byte, signature, secret string) bool {
 func SignWebhookPayload(rawBody []byte, secret string) string {
 	return computeWebhookHMAC(rawBody, secret)
 }
+
+func VerifyWebhookSignatureRaw(rawBody []byte, signature, secret string) bool {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(rawBody)
+	computed := hex.EncodeToString(mac.Sum(nil))
+	return computed == signature
+}
+
+func SignWebhookPayloadRaw(rawBody []byte, secret string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(rawBody)
+	return hex.EncodeToString(mac.Sum(nil))
+}

@@ -10,6 +10,9 @@ import (
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 type Handlers struct {
@@ -267,6 +270,142 @@ func (h *Handlers) ShippingWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[webhook] Order %s: %s → %s (refund=%v)", event.OrderID, order.Status, newStatus, refundTriggered)
+
+	writeJSON(w, http.StatusOK, ShippingWebhookResponse{
+		OrderID:         event.OrderID,
+		ShipmentID:      event.ShipmentID,
+		PreviousStatus:  order.Status,
+		NewStatus:       newStatus,
+		RefundTriggered: refundTriggered,
+		Message:         fmt.Sprintf("order transitioned to %s", newStatus),
+	})
+}
+
+func (h *Handlers) ShippingWebhookV2(w http.ResponseWriter, r *http.Request) {
+	rawBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("[webhook-v2] Failed to read request body: %v", err)
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "failed to read body"})
+		return
+	}
+	defer r.Body.Close()
+
+	signature := r.Header.Get("X-Webhook-Signature")
+	if signature == "" {
+		log.Printf("[webhook-v2] Missing X-Webhook-Signature header")
+		writeJSON(w, http.StatusUnauthorized, ErrorResponse{Error: "missing signature header"})
+		return
+	}
+
+	if !VerifyWebhookSignatureRaw(rawBody, signature, h.webhookSecret) {
+		log.Printf("[webhook-v2] Signature verification FAILED")
+		writeJSON(w, http.StatusUnauthorized, ErrorResponse{Error: "invalid webhook signature"})
+		return
+	}
+
+	log.Printf("[webhook-v2] Signature verification PASSED")
+
+	// Intentionally vulnerable parser path for CVE-2024-24786 demo:
+	// protojson.Unmarshal with DiscardUnknown on older protobuf versions.
+	var envelope anypb.Any
+	unmarshalOpts := protojson.UnmarshalOptions{
+		DiscardUnknown: true,
+	}
+	if err := unmarshalOpts.Unmarshal(rawBody, &envelope); err != nil {
+		log.Printf("[webhook-v2] Failed to parse protobuf-JSON envelope: %v", err)
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid protobuf-json envelope"})
+		return
+	}
+
+	var payload wrapperspb.StringValue
+	if err := envelope.UnmarshalTo(&payload); err != nil {
+		log.Printf("[webhook-v2] Failed to decode Any payload: %v", err)
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid Any payload"})
+		return
+	}
+
+	var event ShippingWebhookEvent
+	if err := json.Unmarshal([]byte(payload.Value), &event); err != nil {
+		log.Printf("[webhook-v2] Failed to parse shipping event: %v", err)
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid shipping event"})
+		return
+	}
+
+	log.Printf("[webhook-v2] Received event: shipment=%s order=%s type=%s status=%s",
+		event.ShipmentID, event.OrderID, event.EventType, event.Status)
+
+	if event.OrderID == "" || event.ShipmentID == "" {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "order_id and shipment_id are required"})
+		return
+	}
+
+	order, err := h.store.GetOrder(r.Context(), event.OrderID)
+	if err != nil {
+		if errors.Is(err, ErrOrderNotFound) {
+			writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "order not found"})
+			return
+		}
+		log.Printf("[webhook-v2] GetOrder error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to get order"})
+		return
+	}
+
+	if order.Status != StatusShipping {
+		log.Printf("[webhook-v2] Order %s is not in SHIPPING state (current=%s), ignoring", event.OrderID, order.Status)
+		writeJSON(w, http.StatusConflict, ErrorResponse{
+			Error: fmt.Sprintf("order is in %s state, expected SHIPPING", order.Status),
+		})
+		return
+	}
+
+	var newStatus, reason string
+	var refundTriggered bool
+
+	switch event.Status {
+	case ShipStatusDelivered:
+		newStatus = StatusDelivered
+		reason = fmt.Sprintf("delivered — confirmed by webhook-v2 (shipment %s)", event.ShipmentID)
+
+	case ShipStatusLost, ShipStatusDamaged:
+		newStatus = StatusShipFailed
+		reason = fmt.Sprintf("shipment %s — refund initiated (shipment %s)",
+			strings.ToLower(event.Status), event.ShipmentID)
+		refundTriggered = true
+		log.Printf("[webhook-v2] *** REFUND TRIGGERED for order %s (shipment %s, reason: %s) ***",
+			event.OrderID, event.ShipmentID, event.Status)
+
+	case ShipStatusInTransit:
+		log.Printf("[webhook-v2] Order %s: shipment %s is in transit", event.OrderID, event.ShipmentID)
+		writeJSON(w, http.StatusOK, ShippingWebhookResponse{
+			OrderID:         event.OrderID,
+			ShipmentID:      event.ShipmentID,
+			PreviousStatus:  order.Status,
+			NewStatus:       order.Status,
+			RefundTriggered: false,
+			Message:         "status noted, no state change",
+		})
+		return
+
+	case ShipStatusReturned:
+		newStatus = StatusShipFailed
+		reason = fmt.Sprintf("shipment returned (shipment %s)", event.ShipmentID)
+
+	default:
+		log.Printf("[webhook-v2] Unknown shipping status: %s", event.Status)
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error: fmt.Sprintf("unknown shipping status: %s", event.Status),
+		})
+		return
+	}
+
+	err = h.store.UpdateOrderStatus(r.Context(), event.OrderID, newStatus, reason)
+	if err != nil {
+		log.Printf("[webhook-v2] UpdateOrderStatus error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to update order status"})
+		return
+	}
+
+	log.Printf("[webhook-v2] Order %s: %s → %s (refund=%v)", event.OrderID, order.Status, newStatus, refundTriggered)
 
 	writeJSON(w, http.StatusOK, ShippingWebhookResponse{
 		OrderID:         event.OrderID,

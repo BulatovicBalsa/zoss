@@ -75,6 +75,7 @@ func main() {
 
 	// Shipping webhook endpoint (receives status updates from logistics provider)
 	r.Post("/webhooks/shipping", h.ShippingWebhook)
+	r.Post("/webhooks/shipping/v2", h.ShippingWebhookV2)
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

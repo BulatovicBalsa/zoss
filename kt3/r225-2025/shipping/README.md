@@ -22,7 +22,7 @@ Tranzicije iz stanja `SHIPPING` pokreću se isključivo webhook-ovima od logisti
 
 Kada sistem primi webhook sa statusom `LOST` ili `DAMAGED`, automatski se pokreće refund proces — kupcu se vraća puni iznos porudžbine. Ova funkcionalnost je kritična sa bezbjednosnog stanovišta jer direktno utiče na finansijske transakcije.
 
-Implementacija verifikacije webhook potpisa koristi JSON deserializaciju i ponovnu serializaciju payload-a prije izračunavanja HMAC vrijednosti. Budući da JSON nije kanoničan format, a verifikacijski struct ne uključuje sva polja iz payload-a, napadač može izmijeniti `status` polje unutar payload-a, zadržati originalni potpis i proći verifikaciju, čime se omogućava manipulacija statusima pošiljki i pokretanje neovlaštenih refund procesa.
+Implementacija verifikacije webhook potpisa koristi JSON deserializaciju i ponovnu serializaciju payload-a prije izračunavanja HMAC vrijednosti. Budući da JSON nije kanoničan format, a verifikacioni struct ne uključuje sva polja iz payload-a, napadač može izmijeniti `status` polje unutar payload-a, zadržati originalni potpis i proći verifikaciju, čime se omogućava manipulacija statusima pošiljki i pokretanje neovlaštenih refund procesa.
 
 Ovaj dokument opisuje ranjivost JSON canonicalization-based webhook verifikacije, demonstrira eksploataciju putem manipulacije payload-a, i prikazuje mitigaciju uvođenjem raw-byte HMAC verifikacije.
 
@@ -71,7 +71,7 @@ Primarni afektovani resurs. Webhook manipulacija direktno narušava integritet p
 
 - **Status porudžbine** se mijenja na osnovu lažnog webhook-a. Porudžbina koja je u tranzitu prelazi u `SHIP_FAILED` bez stvarnog problema sa pošiljkom.
 - **Reason polje** bilježi lažni razlog (npr. "shipment lost — refund initiated") koji ne odgovara stvarnom stanju pošiljke.
-- **Status historija** bilježi tranziciju `SHIPPING → SHIP_FAILED` pokrenutu lažnim webhook-om, koja se ne razlikuje od legitimne tranzicije.
+- **Istorija statusa** bilježi tranziciju `SHIPPING → SHIP_FAILED` pokrenutu lažnim webhook-om, koja se ne razlikuje od legitimne tranzicije.
 
 **CIA triada**: Integritet je kompromitovan.
 
@@ -269,7 +269,68 @@ docker compose up -d ordering-service
 
 ---
 
-## 8. Demonstracija mitigacije
+## 8. Analiza logova aplikacije
+
+### 8.1 Logovi u ranjivom stanju (prije patch-a)
+
+#### Webhook sa statusom `IN_TRANSIT` (legitimni)
+
+```
+[webhook] Canonical payload for HMAC: {"shipment_id":"SH-2f9f5815","order_id":"2f9f5815-...","event_type":"status_update","timestamp":1771785857}
+[webhook] Computed HMAC: 57f3de48ae338cd21a457d49b1fdaa802b32aa8245526d1a7899f97d08cf35cc
+[webhook] Provided HMAC: 57f3de48ae338cd21a457d49b1fdaa802b32aa8245526d1a7899f97d08cf35cc
+[webhook] Signature verification PASSED
+[webhook] Received event: shipment=SH-2f9f5815 order=2f9f5815-... type=status_update status=IN_TRANSIT
+[webhook] Order 2f9f5815-...: shipment SH-2f9f5815 is in transit
+```
+
+#### Webhook sa statusom `LOST` (napadačev — isti potpis!)
+
+```
+[webhook] Canonical payload for HMAC: {"shipment_id":"SH-2f9f5815","order_id":"2f9f5815-...","event_type":"status_update","timestamp":1771785857}
+[webhook] Computed HMAC: 57f3de48ae338cd21a457d49b1fdaa802b32aa8245526d1a7899f97d08cf35cc
+[webhook] Provided HMAC: 57f3de48ae338cd21a457d49b1fdaa802b32aa8245526d1a7899f97d08cf35cc
+[webhook] Signature verification PASSED                                    ← ISTI potpis prošao za RAZLIČIT status!
+[webhook] Received event: shipment=SH-2f9f5815 order=2f9f5815-... type=status_update status=LOST
+[webhook] *** REFUND TRIGGERED for order 2f9f5815-... (shipment SH-2f9f5815, reason: LOST) ***
+[webhook] Order 2f9f5815-...: SHIPPING → SHIP_FAILED (refund=true)
+```
+
+Oba webhook-a (sa `status=IN_TRANSIT` i `status=LOST`) produciraju **identičnu kanoničku formu** jer `WebhookSignatureData` struct ne sadrži `status` polje. `json.Unmarshal` tiho odbacuje `status`, a `json.Marshal` ga ne uključuje u izlaz. Rezultat:
+
+1. Canonical payload za oba: `{"shipment_id":"SH-2f9f5815","order_id":"2f9f5815-...","event_type":"status_update","timestamp":1771785857}` — **identično**
+2. HMAC za oba: `57f3de48...` — **identično**
+3. Verifikacija za oba: `PASSED` — server ne može razlikovati legitimni od lažnog webhook-a
+4. Napadačev webhook sa `status=LOST` pokreće refund od $1,299.99
+
+---
+
+### 8.2 Logovi u patchovanom stanju (poslije patch-a)
+
+#### Webhook sa statusom `IN_TRANSIT` (napadačev potpis nad kanoničkom formom)
+
+```
+[webhook] Computed HMAC (over 153 raw bytes): ee2f35ca9a7195400c2ab600f0b85ac1e9a281beb15f5d23da9496ce7b7b9a58
+[webhook] Provided HMAC: d181bf06d3366e5f2bf96d5eb36807ae1cb1d542000fb33855afe2e6f94f3703
+[webhook] Signature verification FAILED
+```
+
+#### Webhook sa statusom `LOST` (napadačev potpis nad kanoničkom formom)
+
+Napadačeva skripta ne stiže do ovog koraka jer je već prvi webhook odbijen (HTTP 401). Ali čak i da se pošalje, rezultat bi bio isti — `Signature verification FAILED`.
+
+Nakon primjene patch-a, server izračunava HMAC nad **kompletnim sirovim bajtovima** HTTP request body-ja, a ne nad kanonizovanom formom. Ovo znači:
+
+1. **Computed HMAC** se računa nad cijelim payload-om uključujući `status` polje: `{"shipment_id":"SH-...","order_id":"...","event_type":"status_update","status":"IN_TRANSIT","timestamp":...}` (153 bytes)
+2. **Provided HMAC** je izračunat nad kanoničkom formom (bez `status` polja): `{"shipment_id":"SH-...","order_id":"...","event_type":"status_update","timestamp":...}` (kraći payload)
+3. Potpisi se ne poklapaju → `hmac.Equal()` vraća `false` → HTTP 401 Unauthorized
+4. Refund **nije pokrenut** — napad je blokiran
+
+Dodatno, `hmac.Equal()` koristi konstantno-vremensko poređenje, čime se eliminiše mogućnost timing side-channel napada za rekonstrukciju HMAC vrijednosti.
+
+---
+
+## 9. Demonstracija mitigacije
 
 ```bash
 ./attack.sh http://localhost:8080
