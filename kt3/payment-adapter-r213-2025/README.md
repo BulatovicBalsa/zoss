@@ -19,7 +19,7 @@ Dvije ranjivosti demonstrirane su praktičnim napadom sa funkcionalnim PoC-om.
 
 `SmallVec::grow()` u verzijama `< 0.6.10` sadrži logičku grešku pri realokaciji interne memorije koja uzrokuje **double-free** i **heap buffer overflow**. Memorijska korupcija detektovana Valgrind alatom.
 
-[Dokumentacija](Documentation/Rust%20smallvec%20memory%20corruption.md) | [PoC](PoCs/smallvec-poc/)
+[Dokumentacija](Documentation/Rust%20smallvec%20memory%20corruption.md) | [PoC](PoCs/smallvec-poc/) | [Video](PoCs/smallvec-poc-video.mp4)
 
 ---
 
@@ -28,7 +28,7 @@ Dvije ranjivosti demonstrirane su praktičnim napadom sa funkcionalnim PoC-om.
 
 `yaml-rust < 0.4.1` implementira rekurzivni descent parser bez ograničenja dubine rekurzije. Duboko ugniježdeni YAML dokument (npr. `{a: {a: {a: ...}}}` sa 100 000 nivoa) prekoračuje call stack i terminira proces putem `abort()` bez mogućnosti oporavka. Napadački payload je veličine samo ~600 KB.
 
-[Dokumentacija](Documentation/Uncontrolled%20Recursion%20DoS%20Yaml-Rust%20Attack.md) | [PoC](PoCs/yaml-poc/)
+[Dokumentacija](Documentation/Uncontrolled%20Recursion%20DoS%20Yaml-Rust%20Attack.md) | [PoC](PoCs/yaml-poc/) | [Video](PoCs/yaml-poc-video.mp4)
 
 ---
 
