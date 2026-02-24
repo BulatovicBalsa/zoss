@@ -22,6 +22,8 @@ Zajednička demo aplikacija se nalazi u [`demo/`](demo/) folderu.
 
 Demo aplikacija je Go servis koji implementira Ordering state machine sa Redis distribuiranim lock-om i Shipping webhook endpoint-om sa HMAC verifikacijom. Koristi Cassandru za perzistenciju i Redis za distribuirano zaključavanje.
 
+U praksi Ordering i Shipping bi bili odvojeni servisi, ali su ovde spojeni zbog jednostavnosti demonstracije napada. Arhitektura je pojednostavljena i fokusirana na ključne komponente relevantne za napade.
+
 ![Arhitektura demo aplikacije](demo/architecture.png)
 
 ### Pokretanje
@@ -61,6 +63,7 @@ cd ordering
 chmod +x attack.sh
 ./attack.sh http://localhost:8080 20
 ```
+Demo video nije postavljen zbog nedeterminističke prirode napada.
 
 **Mitigacija**: Owner-aware lock sa UUID vrijednošću i Lua skriptom za atomski release. Detalji u [`ordering/README.md`](ordering/README.md).
 
@@ -78,6 +81,7 @@ cd shipping
 chmod +x attack.sh
 ./attack.sh http://localhost:8080
 ```
+Demo video je dostupan: [`shipping/webhook_attack.mp4`](shipping/webhook_attack.mp4).
 
 **Mitigacija**: Raw-byte HMAC verifikacija nad kompletnim payload-om + konstantno-vremensko poređenje. Detalji u [`shipping/README.md`](shipping/README.md).
 
@@ -95,14 +99,61 @@ cd shipping-v2-protobuf
 chmod +x attack.sh
 ./attack.sh http://localhost:8080
 ```
+Demo video je dostupan: [`shipping-v2-protobuf/protobuff_attack.mp4`](shipping-v2-protobuf/protobuff_attack.mp4).
 
 **Mitigacija**: Upgrade protobuf biblioteke na `v1.33.0+` (fix u dekoderu i `skipJSONValue()`) i defense-in-depth postavljanje `DiscardUnknown=false`. Detalji u [`shipping-v2-protobuf/README.md`](shipping-v2-protobuf/README.md).
 
 ---
 
-## Ostali napadi na Ordering podsistem
+## Teorijski napadi (bez demo)
 
-U nastavku su teorijski opisani ostali napadi koji se mogu izvršiti na Ordering podsistem, zajedno sa odgovarajućim mitigacijama.
+| # | Podsistem / Komponenta | Napad | Folder |
+|---|------------------------|-------|--------|
+| A | **Ordering** (Cassandra 4.0.x) | Remote Code Execution putem User Defined Functions (CVE-2021-44521) | [`cassandra-udf-rce/`](cassandra-udf-rce/) |
+| B | **Ordering** (Redis — Debian paket) | Lua Sandbox Escape — RCE (CVE-2022-0543) | [`redis-lua-rce/`](redis-lua-rce/) |
+| C | **Ordering** | IDOR — Neovlašteni pristup i izmjena tuđih porudžbina | [`idor/`](idor/) |
+
+---
+
+### Napad A: CVE-2021-44521 — Cassandra UDF Remote Code Execution
+
+**Folder**: [`cassandra-udf-rce/`](cassandra-udf-rce/)
+
+**Ranjive verzije**: Apache Cassandra 3.0.x < 3.0.26, 3.11.x < 3.11.12, 4.0.x < 4.0.2
+
+**Ranjivost**: Kada je `enable_user_defined_functions_threads: false` u `cassandra.yaml`, Cassandra izvršava UDF-ove u glavnom JVM threadu bez aktivnog Java SecurityManager-a. Napadač sa `CREATE FUNCTION` privilegijom može kreirati UDF koji poziva `Runtime.getRuntime().exec()` i izvršiti proizvoljne OS komande na serveru baze podataka. U kontekstu Ordering podsistema, kompromitovanje Cassandre znači potpunu kompromitaciju svih porudžbina, istorije stanja i korisničkih podataka.
+
+**Mitigacija**: Upgrade na Cassandra 4.0.2+ / 3.11.12+, postavljanje `enable_user_defined_functions: false` ako UDF-ovi nisu potrebni, i restrikcija `CREATE FUNCTION` privilegija na aplikacioni korisnik. Detalji u [`cassandra-udf-rce/README.md`](cassandra-udf-rce/README.md).
+
+---
+
+### Napad B: CVE-2022-0543 — Redis Lua Sandbox Escape
+
+**Folder**: [`redis-lua-rce/`](redis-lua-rce/)
+
+**Ranjive verzije**: Redis kao Debian/Ubuntu sistemski paket (`apt-get install redis-server`):
+- Debian 10 Buster: < `5:5.0.14-1+deb10u4`
+- Debian 11 Bullseye: < `5:6.0.16-1+deb11u2`
+
+**Ranjivost**: Debian/Ubuntu maintaineri kompajliraju Redis sa dinamičkim linkovanjem sistemske `liblua` biblioteke, koja uključuje `package` modul koji upstream Redis namjerno izostavlja. Redis sandbox ne blokira `package.loadlib()`, pa napadač može učitati libc i dobiti pristup `io.popen()` → RCE na Redis hostu jednom `EVAL` komandom. Ranjivost je posebno relevantna jer mitigirani owner-aware lock (Napad 1) koristi upravo `EVALSHA` Lua skriptu — isti mehanizam koji CVE-2022-0543 eksploatiše.
+
+**Mitigacija**: Koristiti upstream Redis (zvanični Docker image `redis:7-alpine` ili binary sa redis.io) umjesto Debian paketa. Detalji u [`redis-lua-rce/README.md`](redis-lua-rce/README.md).
+
+---
+
+### Napad C: IDOR — Neovlašteni pristup tuđim porudžbinama
+
+**Folder**: [`idor/`](idor/)
+
+**Ranjivost**: `GET /orders/{orderID}` i ostali endpointi (`/pay`, `/cancel`, `/ship`, `/history`) ne provjeravaju da li autentifikovani korisnik posjeduje traženu porudžbinu. Sistem razlikuje autentifikaciju od autorizacije na nivou resursa, ali implementira samo prvu. Napadač sa validnim tokenom može pristupiti ili modifikovati porudžbine bilo kojeg drugog korisnika uz poznavanje UUID-a, koji se tipično eksponira putem email potvrde, referral linka ili customer support kanala.
+
+**Mitigacija**: Ownership check u svakom handleru (`order.CustomerID != authenticatedUserID → HTTP 403`), rate limiting na GET endpointima i audit logging za mismatch događaje. Detalji u [`idor/README.md`](idor/README.md).
+
+---
+
+## Ostali napadi na Ordering i Shipping podsisteme
+
+U nastavku su teorijski opisani ostali napadi koji se mogu izvršiti na definisani sistem, zajedno sa odgovarajućim mitigacijama.
 
 ### 1. Price Manipulation — TOCTOU (Time-of-Check Time-of-Use)
 
@@ -177,41 +228,7 @@ U nastavku su teorijski opisani ostali napadi koji se mogu izvršiti na Ordering
 
 ---
 
-### 3. IDOR (Insecure Direct Object Reference) na porudžbinama
-
-**Pretnja**: Napadač pristupa ili modifikuje porudžbine drugih korisnika pogađanjem ili enumeracijom `order_id` vrijednosti.
-
-**CWE referenca**: CWE-639 (Authorization Bypass Through User-Controlled Key), CWE-284 (Improper Access Control)
-
-**STRIDE**: Information Disclosure, Tampering
-
-**Akter napada**: Autentifikovani korisnik platforme (kupac sa validnim nalogom i JWT tokenom) koji pokušava pristupiti resursima drugih korisnika.
-
-**Preduslovi**:
-- Ordering servis ne implementira ownership provjeru — handler ne provjerava da li `order.customer_id` odgovara `authenticated_user_id` iz JWT tokena
-- Napadač posjeduje validan korisnički nalog i može generisati autentifikovane HTTP zahtjeve (Bearer token)
-- `order_id` koristi predvidljiv format (sekvencijalni integer, kratki alfanumerički string) koji omogućava enumeraciju, ILI napadač je na drugi način saznao tuđi `order_id` (npr. putem referral linka, customer support interakcije, ili URL-a dijeljenog na društvenim mrežama)
-- API Gateway ili middleware sloj ne implementira dodatnu autorizaciju na nivou resursa (oslanja se isključivo na autentifikaciju)
-- Ne postoji rate limiting na `GET /orders/{orderID}` endpointu koji bi ograničio masovnu enumeraciju
-
-**Tok napada**:
-1. Napadač se autentifikuje sa svojim korisničkim nalogom i dobija JWT token
-2. Napadač šalje `GET /orders/{orderID}` sa inkrementiranim ili nasumičnim `order_id` vrijednostima
-3. Za svaki validan `order_id`, servis vraća kompletne podatke o porudžbini: ime kupca, adresu isporuke, stavke, iznos, status plaćanja
-4. Napadač identifikuje porudžbine u stanju `PENDING_PAYMENT` i šalje `POST /orders/{orderID}/cancel` sa tuđim `order_id`
-5. Servis otkazuje tuđu porudžbinu bez provjere vlasništva — kupac čija je porudžbina otkazana ne zna za napad
-6. Varijanta: napadač koristi prikupljene podatke (adresa, stavke, iznos) za phishing ili social engineering napad na žrtvu
-
-**Afektovani resursi**: Customer Data (poverljivost — PII curenje: ime, adresa, email, stavke porudžbine), Ordering podaci (integritet — neautorizovana modifikacija ili otkazivanje tuđih porudžbina). 
-**Mitigacija**:
-- **Ownership check** — Svaki handler provjerava da `order.customer_id == authenticated_user_id`. Ako ne, vraća HTTP 403 Forbidden.
-- **UUID format** — Korišćenje UUID-a (v4, random) kao `order_id` čini brute-force enumeraciju nepraktičnom (128-bit prostor, ~3.4×10³⁸ mogućih vrijednosti).
-- **Rate limiting** — Ograničenje broja GET zahtjeva po korisniku sprečava masovnu enumeraciju (npr. max 60 zahtjeva po minutu za `/orders/{id}` endpoint).
-- **Audit logging** — Logovanje svih pristupa sa neslaganjem ownership-a radi detekcije pokušaja IDOR napada. Alert na > 10 neuspješnih pristupa tuđim resursima u periodu od 5 minuta.
-
----
-
-### 4. Denial of Service — Mass Order Creation
+### 3. Denial of Service — Mass Order Creation
 
 **Pretnja**: Napadač kreira ogroman broj porudžbina radi preopterećenja sistema (Cassandra, Redis, Kafka).
 
@@ -246,39 +263,3 @@ U nastavku su teorijski opisani ostali napadi koji se mogu izvršiti na Ordering
 - **Rate limiting po IP adresi** — API Gateway nivo zaštite od distribuiranih napada (npr. nginx `limit_req_zone`, AWS WAF rate-based rules).
 - **CAPTCHA na checkout** — Za korisnike koji prekorače normalne obrasce ponašanja. Progressive CAPTCHA: prvi checkout bez CAPTCHA, nakon 5. u roku od sat vremena — reCAPTCHA v3.
 - **Resource quotas** — Ograničenje ukupnog broja `PENDING_PAYMENT` porudžbina po korisniku (npr. max 5 istovremeno). Provjera: `SELECT COUNT(*) FROM ordering.orders WHERE customer_id = ? AND status = 'PENDING_PAYMENT'` prije kreiranja.
-
----
-
-### 5. Cassandra CQL Injection
-
-**Pretnja**: Napadač ubacuje zlonamjerne CQL fragmente kroz korisnički kontrolisane parametre (npr. `reason` polje u cancel zahtjevu).
-
-**CWE referenca**: CWE-943 (Improper Neutralization of Special Elements in Data Query Logic), CWE-89 (SQL Injection — analogno za CQL)
-
-**STRIDE**: Tampering, Denial of Service, Information Disclosure
-
-**Akter napada**: Autentifikovani korisnik platforme koji manipuliše HTTP request body-jem, ili eksterni napadač koji može slati proizvoljne zahtjeve ka API-ju.
-
-**Preduslovi**:
-- Ordering servis koristi string interpolaciju (konkatenaciju) za konstrukciju CQL upita umjesto parametrizovanih upita (prepared statements)
-- Korisnički kontrolisani parametri (npr. `reason`, `customer_id`, `product_id`) se direktno ubacuju u CQL string bez sanitizacije ili validacije
-- GoCQL driver se koristi u modu koji dozvoljava string-based query execution (npr. `session.Query(fmt.Sprintf("UPDATE ... SET reason = '%s' ...", reason))`)
-- Ne postoji input validation na handler nivou koja bi odbila specijalne CQL karaktere (`'`, `;`, `--`)
-- Cassandra RBAC nije konfigurisan — aplikacioni korisnik ima `ALTER`, `DROP` i `TRUNCATE` privilegije na produkcijskim tabelama
-- Servis ne koristi WAF (Web Application Firewall) koji bi detektovao injection pattern-e u request body-ju
-
-**Tok napada**:
-1. Napadač šalje `POST /orders/{orderID}/cancel` sa payload-om: `{"reason": "test'; DROP TABLE ordering.orders; --"}`
-2. Ranjivi handler konstruiše CQL upit: `UPDATE ordering.orders SET reason = 'test'; DROP TABLE ordering.orders; --' WHERE order_id = '...'`
-3. CQL parser interpretira `;` kao separator — izvršava `UPDATE` i zatim `DROP TABLE`
-4. Tabela `ordering.orders` je obrisana — svi podaci o porudžbinama su izgubljeni
-5. Varijanta: napadač koristi `UPDATE ordering.orders SET status = 'PAID' WHERE order_id = '...'` da promijeni status tuđe porudžbine bez plaćanja
-6. Varijanta: napadač koristi `SELECT * FROM ordering.orders` za ekstrakciju podataka svih korisnika (ako rezultat upita leakuje u HTTP odgovor)
-
-**Afektovani resursi**: Ordering podaci (integritet i dostupnost — brisanje ili izmjena podataka), Cassandra (integritet šeme), Customer Data (poverljivost — potencijalno curenje svih porudžbina).
-
-**Mitigacija**:
-- **Prepared statements** — Go aplikacija koristi parametrizovane upite (`?` placeholder-e) za sve CQL operacije. GoCQL driver automatski eskejpuje parametre, čime se CQL injection potpuno eliminiše. Primjer: `session.Query("UPDATE ordering.orders SET reason = ? WHERE order_id = ?", reason, orderID)`.
-- **Input validation** — Validacija dužine (max 500 karaktera) i dozvoljenih karaktera za string polja na handler nivou. Odbijanje unosa koji sadrži `;`, `'`, `--` ili druge CQL meta-karaktere.
-- **Cassandra RBAC** — Aplikacioni korisnik ima isključivo `SELECT`, `INSERT`, `UPDATE` privilegije na produkcijskim tabelama. `DROP`, `ALTER`, `TRUNCATE` su ograničeni na admin korisnika sa odvojenim kredencijalima.
-- **Least privilege princip** — Servis se konektuje na Cassandru sa kredencijalima koji imaju minimalne potrebne privilegije. Produkcijski keyspace ima `ALTER` zaštitu.
