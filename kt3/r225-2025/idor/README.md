@@ -8,7 +8,7 @@
 
 Insecure Direct Object Reference (IDOR) je klasa ranjivosti u kojoj aplikacija koristi korisnički kontrolisani identifikator (ID resursa) za direktan pristup objektu u bazi podataka, bez provjere da li autentifikovani korisnik ima pravo na taj resurs.
 
-U Ordering podsistemu, svaka porudžbina je identifikovana `order_id` vrijednošću (UUID v4). API endpointi za pregled, plaćanje, otkazivanje i iniciranje slanja prihvataju ovaj identifikator iz URL putanje. Ranjivost nastaje jer **nijedan od ovih handlera ne provjerava da li je `order.CustomerID` isti korisnik koji je autentifikovan** — provjera identiteta (autentifikacija) postoji, ali provjera vlasništva (autorizacija na nivou resursa) ne.
+U Ordering podsistemu, svaka porudžbina je identifikovana `order_id` vrijednošću (UUID v4). API endpointi za pregled, plaćanje, otkazivanje i iniciranje slanja prihvataju ovaj identifikator iz URL putanje. Ranjivost nastaje jer **nijedan od ovih handlera ne provjerava da li je `order.CustomerID` isti korisnik koji je autentifikovan**. Provjera identiteta (autentifikacija) postoji, ali provjera vlasništva (autorizacija na nivou resursa) ne.
 
 Posljedica: svaki autentifikovani korisnik platforme može pregledati ili modifikovati porudžbinu bilo kojeg drugog korisnika, uz uslov da zna ili pogodi njen `order_id`.
 
@@ -22,10 +22,10 @@ Posljedica: svaki autentifikovani korisnik platforme može pregledati ili modifi
 |---|---|---|
 | **Spoofing** | Ne | Napadač koristi vlastiti validan nalog — ne lažira identitet. |
 | **Tampering** | Da | Napadač može otkazati, platiti ili inicirati slanje tuđe porudžbine bez vlasnikove saglasnosti. |
-| **Repudiation** | Da | Akcije se bilježe pod napadačevim `order_id` zahtjevima, ali sistem ne biljezi da je pristupljeno tuđem resursu — nema kontekstualne anomalije u logu. |
+| **Repudiation** | Da | Akcije se bilježe pod napadačevim `order_id` zahtjevima, ali sistem ne biljezi da je pristupljeno tuđem resursu — nema anomalije u logu. |
 | **Information Disclosure** | Da | Napadač može pročitati kompletne podatke tuđe porudžbine: ime kupca, adresu isporuke, stavke, iznos i status plaćanja. |
 | **Denial of Service** | Djelimično | Masovno otkazivanje tuđih porudžbina narušava dostupnost servisa za legitimne korisnike. |
-| **Elevation of Privilege** | Da | Napadač djeluje na resursima za koje nema autorizaciju — de facto eskalacija privilegija na nivou podataka. |
+| **Elevation of Privilege** | Da | Napadač djeluje na resursima za koje nema autorizaciju — eskalacija privilegija na nivou podataka. |
 
 ### 2.2 CWE referenca
 
@@ -54,21 +54,15 @@ Svaka porudžbina sadrži `customer_id`, listu artikala, ukupni iznos i podatke 
 
 ### 3.2 Ordering podaci — INTEGRITET
 
-Napadač može otkazati (`PENDING_PAYMENT → CANCELLED`) ili inicirati slanje (`PAID → SHIPPING`) tuđe porudžbine bez znanja vlasnika. State machine tranzicija je ireverzibilna — otkazana porudžbina ne može biti reaktivovana kroz normalni tok.
+Napadač može otkazati (`PENDING_PAYMENT → CANCELLED`) ili inicirati slanje (`PAID → SHIPPING`) tuđe porudžbine bez znanja vlasnika. State machine tranzicija je ireverzibilna tako da otkazana porudžbina ne može biti reaktivirana kroz normalni tok.
 
 **CIA**: Integritet kompromitovan.
 
 ### 3.3 Order status history — POVJERLJIVOST / INTEGRITET
 
-`GET /orders/{orderID}/history` vraća kompletnu historiju stanja porudžbine sa timestamp-ovima i reason string-ovima. Ovi podaci mogu sadržati interne napomene ili informacije o payment provajderu koje ne bi trebale biti javno dostupne.
+`GET /orders/{orderID}/history` vraća kompletnu istoriju stanja porudžbine sa timestamp-ovima i reason string-ovima. Ovi podaci mogu sadržati interne napomene ili informacije o payment provajderu koje ne bi trebale biti javno dostupne.
 
 **CIA**: Povjerljivost i integritet kompromitovani.
-
-### 3.4 Payment integritet — INTEGRITET
-
-Napadač može pozvati `POST /orders/{orderID}/pay` na tuđoj porudžbini sa proizvoljnim `payment_id` vrijednošću, što uzrokuje lažnu tranziciju `PENDING_PAYMENT → PAID` bez stvarnog plaćanja. Ovo je najozbiljnija posljedica — direktni finansijski gubitak za platformu.
-
-**CIA**: Integritet kompromitovan.
 
 ---
 
@@ -82,8 +76,6 @@ func (h *Handlers) GetOrder(w http.ResponseWriter, r *http.Request) {
     orderID := chi.URLParam(r, "orderID")
 
     // RANJIVOST: order se dohvata bez provjere vlasnistva.
-    // Bilo koji autentifikovani korisnik moze proslijediti
-    // tuđi order_id i dobiti kompletne podatke porudzbine.
     order, err := h.store.GetOrder(r.Context(), orderID)
     if err != nil {
         if errors.Is(err, ErrOrderNotFound) {
@@ -133,7 +125,7 @@ func (h *Handlers) CancelOrder(w http.ResponseWriter, r *http.Request) {
 
 ### 5.1 Akter napada
 
-**Autentifikovani korisnik platforme** — napadač koji posjeduje validan korisnički nalog i može generisati HTTP zahtjeve sa ispravnim Bearer tokenom. Napadač ne mora imati posebne privilegije — ranjivost je dostupna svim registrovanim korisnicima.
+**Autentifikovani korisnik platforme** — napadač koji posjeduje validan korisnički nalog i može generisati HTTP zahtjeve sa ispravnim Bearer tokenom. Napadač ne mora imati posebne privilegije što znači da je ranjivost dostupna svim registrovanim korisnicima.
 
 ### 5.2 Preduslovi
 
@@ -186,26 +178,6 @@ func (h *Handlers) CancelOrder(w http.ResponseWriter, r *http.Request) {
 
 4. Porudzbina je trajno otkazana — zrtva mora kreirati novu
 ```
-
-### 5.5 Tok napada — Scenario C: Lažna uplata tuđe porudžbine
-
-```
-1. Napadac pronalazi order_id porudzbine u stanju PENDING_PAYMENT
-
-2. Salje POST /orders/{victim-order-id}/pay bez stvarnog placanja:
-   Authorization: Bearer eyJ...   ← napadacev token
-   Body: { "payment_id": "FAKE-PAYMENT-12345" }
-
-3. Servis izvrsava tranziciju PENDING_PAYMENT → PAID
-   i upisuje lazni payment_id u bazu
-
-4. Napadac zatim inicira slanje:
-   POST /orders/{victim-order-id}/ship
-
-5. Roba je poslana, platforma trpi finansijski gubitak jer
-   stvarna uplata nikad nije izvrsena
-```
-
 ---
 
 ## 6. Mitigacija
@@ -294,24 +266,19 @@ if order.CustomerID != authenticatedUserID {
 }
 ```
 
-### 6.5 Preporuka: admin rola za operativne akcije
-
-Akcije poput `ShipOrder` i `PayOrder` ne bi trebale biti dostupne krajnjim korisnicima u produkciji — to su privilegovane operacije rezervisane za interne servise (Payment servis, Shipping servis). Razdvajanje API-ja na korisničke i interne endpointe uklanja napadnu površinu za ove scenarije.
-
 ### 6.6 Sažetak mitigacionih mjera
 
-| Mjera | Efikasnost | Implementaciona složenost |
-|---|---|---|
-| Ownership check u svim handlerima | Potpuna eliminacija IDOR ranjivosti | Niska |
-| UUID v4 `order_id` format | Smanjuje brute-force rizik | Trivijalna (već implementovano) |
-| Rate limiting na GET endpointima | Ograničava enumeraciju | Niska |
-| Audit logging za mismatch | Detekcija i forenzika | Niska |
-| Razdvajanje korisničkog i internog API-ja | Uklanja napadnu površinu | Srednja |
+| Mjera | Efikasnost |
+|---|---|
+| Ownership check u svim handlerima | Potpuna eliminacija IDOR ranjivosti 
+| UUID v4 `order_id` format | Smanjuje brute-force rizik 
+| Rate limiting na GET endpointima | Ograničava enumeraciju 
+| Audit logging za mismatch | Detekcija i forenzika 
 
 ---
 
 ## 7. Zaključak
 
-IDOR na Ordering podsistemu nastaje zbog fundamentalne greške u dizajnu: sistem razlikuje autentifikaciju od autorizacije na nivou objekta, ali implementira samo prvu. Ranjivost je tihog karaktera — ne generiše greške, ne uzrokuje padove sistema, i teška je za automatsku detekciju jer su svi zahtjevi tehnički ispravni.
+IDOR na Ordering podsistemu nastaje zbog fundamentalne greške u dizajnu: sistem razlikuje autentifikaciju od autorizacije na nivou objekta, ali implementira samo prvu. Ranjivost je tihog karaktera i ne generiše greške, ne uzrokuje padove sistema, i teška je za automatsku detekciju jer su svi zahtjevi tehnički ispravni.
 
-Posljedice su ozbiljne: od curenja PII podataka i narušavanja privatnosti korisnika, do neovlaštenog otkazivanja ili lažnog plaćanja porudžbina s direktnim finansijskim implikacijama. Primarna mitigacija je jednostavna i ne zahtijeva arhitekturalne izmjene: dodavanje jedne provjere (`order.CustomerID != authenticatedUserID → HTTP 403`) u svaki handler koji pristupa porudžbini.
+Posljedice su ozbiljne: od curenja PII podataka i narušavanja privatnosti korisnika, do neovlaštenog otkazivanja.  Primarna mitigacija je jednostavna i ne zahtijeva arhitekturalne izmjene: dodavanje jedne provjere (`order.CustomerID != authenticatedUserID → HTTP 403`) u svaki handler koji pristupa porudžbini.
